@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+import os
+import sys
+import shlex
+import glob
+import time
+import json
+import subprocess
+import argparse
+import re
+import ast
+#import shutil
+#import getpass
+#import grp
+#import pathlib
+
+
+origin_dir = os.getcwd()
+build_json = None
+local_json = None
+template_json = None
+
+will_create_venv = False
+will_create_master = True
+will_create_workers = True
+
+
+def message(*args, **kwargs):
+  # TODO: support redact
+  if options.verbose: print(*args, **kwargs)
+
+
+def emessage(*args, **kwargs):
+  print('error:', *args, file=sys.stderr, **kwargs)
+
+
+def execute(cmd, *args, **kwargs):
+  msg = []
+  redact = kwargs.get('redact', [])
+  for arg in cmd:
+    if arg in redact: msg.append('****')
+    else:             msg.append(shlex.quote(arg))
+  message('@', *msg)
+  return subprocess.run(cmd, *args, **kwargs)
+
+
+def force_link(src, dst):
+  message('ln -sf %s %s' % (src, dst))
+
+  if not options.test:
+    if os.path.islink(dst): os.remove(dst)
+    os.symlink(src, dst)
+
+
+def parse_args():
+  global options
+  description = '''
+A tool to create buildbot master and workers with python venvs.
+Expects jcoffland's buildbot config system.
+'''
+  epilog = '''
+FILES
+  <venv-root>/[<munged label>-]buildbot[-worker]/
+  <master-root>/{.venv,local.json,buildbot.tac,run}
+  <workers-root>/.venv
+  <workers-root>/{clean,stop,restart}-workers.sh
+  <workers-root>/<worker name>/buildbot.tac
+  <template json file>
+'''
+  parser = argparse.ArgumentParser(description=description, epilog=epilog,
+    formatter_class=argparse.RawDescriptionHelpFormatter)
+
+  parser.set_defaults(use_tls=False)
+
+  parser.add_argument('-q', '--quiet', action = 'store_false', dest = 'verbose',
+    default = True, help = 'do not print')
+  '''parser.add_argument('-f', '--force', action = 'store_true', help = 'force overwrite')'''
+  '''parser.add_argument('-u', '--upgrade', action = 'store_true', help = 'upgrade venv, pip modules')'''
+  parser.add_argument('--dry-run', action = 'store_true', dest = 'test',
+    help = 'Do not make any actual changes. NOT FULLY IMPLEMENTED')
+  parser.add_argument('--umask', default = 0o22,
+    help = 'umask used for workers; default: %(default)s (0o22); decimal or octal values are ok; zero/None is ignored')
+  parser.add_argument('--label',
+    help = '''optional label for venv and buildbot config;
+e.g., "production" or "test";
+munged into venv name; may be added to master title''')
+  parser.add_argument('--venv-root', default = '~/.venv',
+    help = 'base venv dir, appended with munged label dir; should not be inside buildbot master/workers roots (default: %(default)s)')
+  parser.add_argument('--localhost', action = 'store_true',
+    help = 'create localhost test config')
+  parser.add_argument('--create-venv', action = 'store_true',
+    help = 'install buildbot venvs')
+  parser.add_argument('--template',
+    help = 'template json file to overwrite <master_root>/local.json')
+  parser.add_argument(
+    # default from build+local.json; "localhost" if options.localhost
+    '--host', help = 'buildbot master host')
+  parser.add_argument(
+    # default build+local.json protocols.pb.port
+    '--port', default = 8012, type=int,
+    help = 'buildbot master port (default: %(default)s)')
+  parser.add_argument('--password',
+    help = 'buildbot password to use; randomly created if not specified or pre-existing in local.json or template')
+  parser.add_argument('--workers-root', default = './run',
+    help = 'root path in which to create buildbot workers; absolute or relative to master-root (default: %(default)s)')
+  # TODO: figure out how to make tls work
+  ''' parser.add_argument('--use-tls', action = 'store_true', help = 'create-workers with --use-tls, unless --localhost')'''
+  parser.add_argument('master_root', default = '.', #type=pathlib.Path,
+    help = 'buildbot master dir with master.cfg, build.json, workers dir (default: %(default)s)')
+  # TODO: flag --worker-name-prefix {debian,redhat,..} for name pattern
+  # disallow '..' '\\'
+  # ? --linux {debian,..} ? or guess
+
+  options = parser.parse_args()
+
+
+def sanity_check():
+  will_create_venv = options.create_venv
+
+  # check options.master_root exists
+  dir = os.path.expanduser(options.master_root)
+  if not os.path.isdir(dir):
+    emessage('buildbot master dir not found:', options.master_root)
+    sys.exit(1)
+  errors = False
+  # check exist master.cfg, build.json, dir workers
+  wdir = os.path.join(dir, 'workers')
+  if not os.path.isdir(wdir):
+    emessage('directory not found:', wdir)
+    errors = True
+  files = ['master.cfg', 'build.json']
+  for file in files:
+    path = os.path.join(dir, file)
+    if not os.path.isfile(path):
+      emessage('buildbot master file not found:', path)
+      errors = True
+  if errors:
+    emessage('does not seem to be a buildbot master at', dir)
+    sys.exit(1)
+
+  # TODO: if not options.force, ensure workers_root does not exist, ...
+
+  # validate and convert umask
+  if not options.umask: options.umask = None
+  arg = str(options.umask)
+  if arg.lower() == "none": arg = "None"
+  if not re.match(r'^(0o)?\d+$', arg) and arg != 'None':
+    emessage('umask needs to be a non-zero number or None')
+    sys.exit(1)
+  try:
+    options.umask = ast.literal_eval(arg) # handle octal umask eg 0o27
+  except Exception as e:
+    emessage(str(e))
+    sys.exit(1)
+  if 0 == options.umask: options.umask = None
+
+  if will_create_master and options.template:
+    # check template file exists and is valid json
+    path = os.path.expanduser(options.template)
+    if path:
+      if not os.path.isfile(path):
+        emessage('template local.json file not found:', path)
+        sys.exit(1)
+      # TODO: check valid json by loading and confirming is a dict
+      message('found template file:', path)
+
+  # ensure these are strings, not None
+  if not options.label: options.label = ''
+
+  # abspath all paths in case of chdir; not None
+  def safe_path(path):
+    if not path: return ''
+    return os.path.abspath(os.path.expanduser(path))
+
+  # careful: some options may not exist; eg, check will_create_master
+  options.venv_root = safe_path(options.venv_root)
+  options.master_root = safe_path(options.master_root)
+  # TODO: handle "" intelligently elsewhere
+  # join(workers_root, workername) would be "workername", a relative path
+  options.workers_root = safe_path(options.workers_root)
+  options.template = safe_path(options.template)
+
+
+def create_venv_buildbot_at_path(path):
+  # TODO: return if venv exists and not options.force/upgrade
+  path = os.path.expanduser(path)
+  prompt = 'buildbot'
+  cmd = ['python3', '-m', 'venv', '--prompt', prompt, os.path.realpath(path)]
+  if options.test: message('not running:', *cmd)
+  else: execute(cmd)
+  if options.test: return # no venv, so no pip
+  pip = [os.path.join(path, 'bin', 'pip3'), 'install']
+  if not options.verbose: pip += ['-q']
+  if options.test: pip += ['--dry-run']
+  reqs = os.path.join(options.master_root, 'requirements.txt')
+  if os.path.isfile(reqs):
+    execute(pip + ['-r', reqs])
+  else:
+    message('skipping requirements, not found:', reqs)
+    execute(pip + ['--upgrade', 'pip'])
+    execute(pip + ['--upgrade',
+      'buildbot[tls]', 'buildbot-www', 'buildbot-waterfall-view',
+      'buildbot-console-view', 'buildbot-wsgi_dashboards', 'boto3'])
+
+
+def create_venv_buildbot_workers_at_path(path):
+  # TODO: return if venv exists and not options.force/upgrade
+  path = os.path.expanduser(path)
+  prompt = 'buildbot-worker'
+  cmd = ['python3', '-m', 'venv', '--prompt', prompt, os.path.realpath(path)]
+  if options.test: message('not running:', *cmd)
+  else: execute(cmd)
+  if options.test: return # no venv, so no pip
+  pip = [os.path.join(path, 'bin', 'pip3'), 'install']
+  if not options.verbose: pip += ['-q']
+  if options.test: pip += ['--dry-run']
+  execute(pip + ['--upgrade', 'pip'])
+  execute(pip + ['--upgrade', 'buildbot-worker', 'scons'])
+
+
+def create_buildbot_password():
+  # PASS=$(openssl rand -base64 32 | tr -dc a-zA-Z0-9 | head -c14)
+  cmd = 'openssl rand -base64 32'.split()
+  r = execute(cmd, capture_output = True)
+  if r.returncode: raise Exception(r.stderr.decode('utf-8'))
+  password = r.stdout.decode('utf-8')
+  password = re.sub(r'[^A-Za-z0-9]+', '', password)
+  if not password: password = ''
+  return password[:14]
+
+
+def init():
+  # do not use message() or execute() before parse_args()
+  parse_args()
+  sanity_check()
+
+
+def setup_common():
+  # FIXME: should not chdir until all paths have been made absolute
+  # or should instead always join(origin_dir, some_path)
+  os.chdir(os.path.expanduser(options.master_root))
+  message('options: ', options)
+  message('platform:', sys.platform)
+  message('script:', os.path.realpath(__file__))
+  message('start directory:', origin_dir)
+  message('current directory:', os.getcwd())
+
+  # TODO: delay until we know password would not be in final merged local.json
+  if not options.password:
+    message('creating a default password')
+    options.password = create_buildbot_password()
+
+  if options.umask:
+    message('setting umask', oct(options.umask))
+    os.umask(options.umask)
+
+  create_buildbot_venvs()
+
+
+def worker_names_for_pattern(pattern):
+  names = []
+  fpat = os.path.join('workers', pattern, 'build.json')
+  files = glob.glob(fpat)
+  for path in files:
+    name = os.path.basename(os.path.dirname(path))
+    if name: names.append(name)
+  return names
+
+
+def worker_names_for_patterns(patterns):
+  names = []
+  for pattern in patterns:
+    names += worker_names_for_pattern(pattern)
+  return names
+
+
+def munged_label():
+  label = options.label
+  label = label.lower().strip().replace('..', '-')
+  label = re.sub(r'\s+', '-', label)
+  return label
+
+
+def create_buildbot_venvs():
+  if not options.create_venv:
+    message('not installing buildbot venv; use --create-venv to do so')
+    return
+  label = options.label
+  message('label: "%s"' % label)
+  name = munged_label()
+  message('munged label: "%s"' % name)
+  if name: name = name + '-'
+  name_m = name + 'buildbot'
+  name_w = name + 'buildbot-worker'
+  venv_path_master = os.path.join(options.venv_root, name_m)
+  venv_path_worker = os.path.join(options.venv_root, name_w)
+  message('venv_path_master:', venv_path_master)
+  message('venv_path_worker:', venv_path_worker)
+  message()
+  create_venv_buildbot_at_path(venv_path_master)
+  create_venv_buildbot_workers_at_path(venv_path_worker)
+
+
+def worker_name_patterns():
+  # I think only worker patterns are platform-specific
+  if sys.platform == 'darwin': return ['osx*', 'mac*']
+  if sys.platform == 'win32':  return ['win*']
+  # TODO: guess linux debian, redhat
+  if sys.platform == 'linux':  return ['debian*']
+  return []
+
+
+def create_buildbot_worker(name):
+  message('create buildbot worker:', name)
+  message('not implemented')
+
+
+# TODO: create workers
+'''
+  chdir options.master_root
+  validate master-root and files, local.json must exist
+  assume local.json is correctly configured already
+  from "master.cfg" import BuildmasterConfig # ok even not JSONBuildmasterConfig
+  create dir options.worker_root
+  gather worker_names in basename glob ./workers/{osx*,macos*}
+  for each workername in worker_names
+    create dir worker_root/workername # optional if not deep
+    ?? buildbotURL.host : conf.protocols.pb.port
+    execute(cmd, redact=[password]) # in create_worker()
+    no tls if localhost
+    buildbot-worker create-worker --relocatable --umask=18 --use-tls \
+      worker_root/workername localhost:8012 workername password
+    note venv is not relocatable; maybe venvs should be
+     fixed at separate ~/camotics-buildbot-venv/
+    symlink <workers-root>/.venv -> <venv-root>/[<munged label>-]buildbot-worker
+    cp convenience scripts/restart-workers.sh ...
+'''
+def create_buildbot_workers():
+  names = worker_names_for_patterns(worker_name_patterns())
+  message('worker names:', names)
+  for name in names: create_buildbot_worker(name)
+  # TODO: if names: create/update .venv symlink
+  # TODO: copy convenience scripts {clean,stop,restart}-workers.sh
+
+
+# TODO: create master
+'''
+  if exists local.json~, delete
+  if exists local.json, rename local.json~
+
+  load template file for ./local.json
+  set values from cmd line
+
+  load build.json, local.json, make merged json for convenience
+  create/edit local.json
+    master > title += ' ' + label # 'CAMotics TEST'
+    worker > password = pass
+  if not data.worker.password, set to options.password
+  only if want local master, create master
+  if npm exists,
+    npm install
+    npm run build
+  chdir options.master_root
+  buildbot create-master --relocatable .
+  abs symlink <master-root>/.venv -> <venv-root>/[<munged label>-]buildbot
+'''
+def create_buildbot_master():
+  message('create buildbot master at', os.path.abspath(options.master_root))
+  message('not implemented')
+'''
+'''
+  # create/backup overwrite local.json
+  # buildbot create-master --relocatable .
+  # if npm exists, setup npm, else message re no npm
+  #   npm install
+  #   npm run build
+  # create/update .venv symlink
+  # convenience scripts/restart-master.sh
+
+
+def setup_darwin():
+  # TODO: move most of this to setup_common()
+  create_buildbot_master()
+  create_buildbot_workers()
+
+
+def run():
+  if not sys.platform in ['darwin']:
+    emessage('unsupported platform:', sys.platform)
+    sys.exit(1)
+  init()
+  setup_common()
+  if sys.platform == 'darwin':
+    setup_darwin()
+  message('\ndone')
+
+# TODO: setup-buildbot usage should resemble buildbot or conda
+'''
+  setup-buildbot <command>  <master dir> [common options]
+  commands
+    create-venv
+    create-master [--localhost] [--template <file path>]
+    create-workers [--use-tls] [--workers-root <dir path>]
+    create-all
+  common options
+    -h, --help
+    -q, --quiet
+    --dry-run
+    --label <label>
+    --umask <integer or octal string>
+    --venv-root <dir path>
+  create master or workers options
+    --host <master host>
+    --port <master port integer>
+    --password <string>
+'''
+
+if __name__ == '__main__': run()

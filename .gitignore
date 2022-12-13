@@ -29,9 +29,12 @@
 .sconsign.dblite
 
 # Build byproducts
+/scons-env-options.py
 /build
 /config.log
 /package.txt
+/package-description.txt
+/dist.txt
 moc_*.cc
 /*.AppImage
 
@@ -52,6 +55,9 @@ moc_*.cc
 *.deb
 *.rpm
 *.exe
+/*.app
+/*.app.zip
+/*.pkg
 
 # Ninja
 .ninja_deps

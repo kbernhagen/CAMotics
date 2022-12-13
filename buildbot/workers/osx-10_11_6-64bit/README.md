@@ -8,7 +8,9 @@ Same as on Linux but with pointer compression enabled.
 
 # Install Qt
 
-Installed Qt 5.12.12 as admin.  Linked to ``build`` directory.
+https://download.qt.io/official_releases/online_installers/
+
+Installed Qt 5.12.12 as admin.  Linked to it in ``~buildbot/build`` directory.
 
 # OpenSSL
 
@@ -21,12 +23,12 @@ Installed Qt 5.12.12 as admin.  Linked to ``build`` directory.
 
 # Install worker
 
-    python3 -m pip install --upgrade pip
-    pip3 install --user buildbot-worker
+    python3 -m pip install --user --upgrade pip buildbot-worker scons
 
 Then:
-    WORKER=~/Library/Python/3.9/bin/buildbot-worker
-    $WORKER create-worker . master.camotics.org:8012 osx-10_11_6-64bit <password>
+    WORKER="$(python3 -m site --user-base)/bin/buildbot-worker"
+    $WORKER create-worker --umask=0o22 . master.camotics.org:8012 \
+      osx-10_11_6-64bit <password>
     $WORKER start
 
 # Unlock keychain

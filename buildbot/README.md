@@ -36,14 +36,14 @@ Create and enter an Python virtual environment:
 
 Install buildbot in the virtual environment with:
 
-    pip3 install buildbot-worker
+    pip3 install buildbot-worker scons
 
 Create the worker
 
-    buildbot-worker create-worker . localhost:8012 <worker> <password>
+    buildbot-worker create-worker --umask=0o22 . localhost:8012 <worker> <password>
 
 Where ``<worker>`` and ``<password>`` are the worker name and password and
-defined on the master.  The worker name will be the same as it's directory name
+defined on the master.  The worker name will be the same as its directory name
 in the ``workers`` directory.
 
 Start the worker
