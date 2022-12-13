@@ -1,9 +1,9 @@
 ## Master Setup
 Install software:
 
-    sudo apt-get install -y python3-pip python3-virtualenv git
+    sudo apt-get install -y python3-pip python3-virtualenv git npm
 
-Create and enter an Python virtual environment in this directory:
+Create and enter a Python virtual environment in this directory:
 
     virtualenv .
     source bin/activate
@@ -28,7 +28,7 @@ Install software:
 
     sudo apt-get install -y python3-pip python3-virtualenv git
 
-Create and enter an Python virtual environment:
+Create and enter a Python virtual environment:
 
     virtualenv worker
     cd worker
@@ -36,14 +36,14 @@ Create and enter an Python virtual environment:
 
 Install buildbot in the virtual environment with:
 
-    pip3 install buildbot-worker
+    pip3 install buildbot-worker scons six
 
 Create the worker
 
     buildbot-worker create-worker . localhost:8012 <worker> <password>
 
-Where ``<worker>`` and ``<password>`` are the worker name and password and
-defined on the master.  The worker name will be the same as it's directory name
+Where ``<worker>`` and ``<password>`` are the worker name and password as
+defined on the master.  The worker name will be the same as its directory name
 in the ``workers`` directory.
 
 Start the worker
